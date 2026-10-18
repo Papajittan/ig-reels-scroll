@@ -1,0 +1,11 @@
+[package]
+name = "ig-reels-scroll"
+version = "0.1.0"
+edition = "2021"
+description = "Tile and scroll Instagram Reels in Firefox on KDE Plasma Wayland"
+repository = "https://github.com/Papajittan/ig-reels-scroll"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+wdotool-core = { version = "0.5.3", default-features = false, features = ["kde", "libei"] }
