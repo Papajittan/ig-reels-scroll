@@ -11,6 +11,7 @@ For when scrolling one window by hand has become an administrative burden.
 - Starts additional windows further down the feed to reduce simultaneous repeats.
 - Stops when you press **X**, even with Firefox focused. **Ctrl-C** in the terminal also works.
 - Reuses one input control session per run.
+- Optionally unmutes reels with `--unmute`, leaving already audible reels alone.
 
 This is desktop automation. It takes over your pointer and window focus while it runs. Instagram handles the recommendations; this program handles the clerical work.
 
@@ -61,9 +62,27 @@ cargo run -- --windows 2 --stagger 5
 | `--interval SECONDS` | `3` | Pause between completed passes. Accepts decimals; minimum is 0.2 seconds. |
 | `--stagger N` | `5` | Extra starting scroll steps per window index, from 0 to 100. Use 0 to disable. |
 | `--no-open` | Off | Use existing Firefox windows instead of opening new ones. |
+| `--unmute` | Off | Automatically activate the visible unmute control in each window. |
+| `--no-unmute` | On | Leave audio unchanged. This is the default; the last audio flag wins. |
 | `--help` | | Show usage and exit. |
 
 `--interval` is the pause between passes, not an exact timer for each reel. Focusing windows and sending input takes additional time. Starting offsets happen before the counted passes.
+
+### Automatic unmuting
+
+```bash
+./target/release/ig-reels-scroll --windows 2 --unmute
+```
+
+With `--unmute`, the program checks the active Instagram window after startup and after scrolling. It reads the state of the small speaker at the bottom-right of the reel and clicks it when muted. Firefox exposes this control as an **Adjust volume** slider. The program reads its volume, finds its position relative to the actual tiled window, and sends a normal mouse click. It checks the resulting volume to confirm the click worked. An already audible reel stays audible. Multiple windows can play sound together; the program makes no attempt to turn that into a sensible listening experience.
+
+Layouts with explicit **Unmute**, **Turn audio on**, or **Audio is muted** buttons are also supported. The program does not write Firefox's native accessibility volume properties.
+
+Without `--unmute` (or with `--no-unmute`), the program leaves the existing audio state alone. It does not force videos to be muted.
+
+This feature uses Firefox's AT-SPI accessibility tree and currently recognizes English audio labels. It temporarily enables desktop accessibility if needed, then restores the previous setting on normal exit, X, or Ctrl-C. An accessibility bus (`org.a11y.Bus`, typically provided by `at-spi2-core`) must be available. A forced kill may leave accessibility enabled.
+
+If the control is missing, hidden, ambiguous, or inaccessible, it prints a warning and continues scrolling without toggling audio. Popups, Firefox accessibility restrictions, and Instagram layout changes can prevent detection. This option cannot override a muted Firefox tab, system volume, or a reel with no audio track.
 
 ### Starting offsets
 
@@ -136,4 +155,18 @@ cargo test global_shortcut_calls_stop_and_unloads -- --ignored
 
 That test registers X, invokes its callback through KDE, verifies the stop request, then checks cleanup. It briefly reserves X but does not open Firefox or scroll any pages.
 
-The implementation lives in [`src/main.rs`](src/main.rs); the global stop shortcut and D-Bus receiver live in [`src/stop_key.rs`](src/stop_key.rs).
+The optional audio tests cover the accessibility setting lifecycle and activation of a simulated audio control over D-Bus. The desktop setting test also requires a live accessibility bus:
+
+```bash
+cargo test desktop_accessibility_setting_is_restored -- --ignored
+```
+
+To check the real speaker, open a Reels window first and run the following separately. It focuses the last Instagram window returned by KWin and may click its speaker, so this test changes live playback state:
+
+```bash
+cargo test live_reels_speaker_unmutes_with_pointer_input -- --ignored
+```
+
+Run desktop integration tests one at a time so they do not change the shared accessibility setting during another test.
+
+The implementation lives in [`src/main.rs`](src/main.rs); the global stop shortcut and D-Bus receiver live in [`src/stop_key.rs`](src/stop_key.rs). Optional audio detection lives in [`src/audio.rs`](src/audio.rs).

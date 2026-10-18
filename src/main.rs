@@ -12,6 +12,7 @@ use wdotool_core::{
 
 const REELS_URL: &str = "https://www.instagram.com/reels/";
 
+mod audio;
 mod stop_key;
 
 struct Config {
@@ -20,14 +21,16 @@ struct Config {
     interval: Duration,
     open_browser: bool,
     stagger: u32,
+    unmute: bool,
 }
 
 fn usage(program: &str) {
     eprintln!(
-        "Usage: {program} [--windows N] [--count N] [--interval SECONDS] [--stagger N] [--no-open]\n\
+        "Usage: {program} [--windows N] [--count N] [--interval SECONDS] [--stagger N] [--no-open] [--unmute | --no-unmute]\n\
          KDE Plasma Wayland: tile N Firefox Reels windows and scroll each one.\n\
          Defaults: 1 window, 20 scroll passes, 3 seconds apart, 5 extra starting scrolls per window.\n\
-         Press X anywhere or Ctrl-C in the terminal to stop. --stagger 0 disables starting offsets."
+         Press X anywhere or Ctrl-C in the terminal to stop. --stagger 0 disables starting offsets.\n\
+         --unmute enables automatic unmuting; otherwise audio is left unchanged."
     );
 }
 
@@ -37,6 +40,7 @@ fn parse_args() -> Result<Config, String> {
     let mut interval_secs = 3.0_f64;
     let mut open_browser = true;
     let mut stagger = 5_u32;
+    let mut unmute = false;
     let mut args = env::args();
     let program = args.next().unwrap_or_else(|| "ig-reels-scroll".into());
 
@@ -73,6 +77,8 @@ fn parse_args() -> Result<Config, String> {
                 }
             }
             "--no-open" => open_browser = false,
+            "--unmute" => unmute = true,
+            "--no-unmute" => unmute = false,
             "--stagger" => {
                 stagger = args
                     .next()
@@ -97,6 +103,7 @@ fn parse_args() -> Result<Config, String> {
         interval: Duration::from_secs_f64(interval_secs),
         open_browser,
         stagger,
+        unmute,
     })
 }
 
@@ -288,7 +295,11 @@ async fn confirm_tiling(backend: &DynBackend, ids: &[WindowId]) -> Result<(), St
     Err("KWin did not tile the Firefox windows: they still overlap. Scrolling stopped.".into())
 }
 
-async fn scroll_window(backend: &DynBackend, id: &WindowId) -> Result<(), String> {
+async fn scroll_window(
+    backend: &DynBackend,
+    id: &WindowId,
+    audio: Option<&audio::AudioControl>,
+) -> Result<(), String> {
     backend
         .activate_window(id)
         .await
@@ -309,6 +320,10 @@ async fn scroll_window(backend: &DynBackend, id: &WindowId) -> Result<(), String
         .scroll(0.0, (geometry.height as f64 - 160.0).max(240.0))
         .await
         .map_err(|error| format!("could not scroll Reels: {error}"))?;
+    if let Some(audio) = audio {
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        audio.unmute(backend, &id.0, &geometry).await;
+    }
     Ok(())
 }
 
@@ -321,22 +336,40 @@ async fn run() -> Result<(), String> {
 
     let (_stop_key, mut stop) = stop_key::StopKey::install().await?;
     println!("Global X stop key is ready. Ctrl-C also stops the script.");
-    tokio::select! {
+    let audio = if config.unmute {
+        Some(
+            audio::AudioControl::new()
+                .await
+                .map_err(|e| format!("could not initialize auto-unmute: {e}"))?,
+        )
+    } else {
+        None
+    };
+    let result = tokio::select! {
         biased;
         _ = stop.wait_for(|value| *value == 3) => {
             println!("Stopped by X.");
             Ok(())
         }
         result = tokio::signal::ctrl_c() => {
-            result.map_err(|e| format!("could not listen for Ctrl-C: {e}"))?;
             println!("Stopped by Ctrl-C.");
-            Ok(())
+            result.map_err(|e| format!("could not listen for Ctrl-C: {e}"))
         }
-        result = scroll_reels(config, environment) => result,
+        result = scroll_reels(config, environment, audio.as_ref()) => result,
+    };
+    if let Some(audio) = audio {
+        if let Err(error) = audio.restore().await {
+            eprintln!("Could not restore desktop accessibility setting: {error}");
+        }
     }
+    result
 }
 
-async fn scroll_reels(config: Config, environment: Environment) -> Result<(), String> {
+async fn scroll_reels(
+    config: Config,
+    environment: Environment,
+    audio: Option<&audio::AudioControl>,
+) -> Result<(), String> {
     // Keep one portal connection alive for the whole run. Spawning a separate
     // wdotool process for every mouse action starts a new Remote Desktop session
     // each time, which produces a stack of KDE Portal Integration notifications.
@@ -383,6 +416,19 @@ async fn scroll_reels(config: Config, environment: Environment) -> Result<(), St
     );
     tokio::time::sleep(Duration::from_secs(8)).await;
 
+    if let Some(audio) = audio {
+        println!("Auto-unmute enabled for all selected windows.");
+        for id in &ids {
+            backend
+                .activate_window(id)
+                .await
+                .map_err(|e| e.to_string())?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let geometry = window_geometry(&backend, id).await?;
+            audio.unmute(&backend, &id.0, &geometry).await;
+        }
+    }
+
     for (index, id) in ids.iter().enumerate().skip(1) {
         let offset = starting_offset(index, config.stagger);
         if offset > 0 {
@@ -391,7 +437,7 @@ async fn scroll_reels(config: Config, environment: Environment) -> Result<(), St
                 index + 1
             );
             for _ in 0..offset {
-                scroll_window(&backend, id).await?;
+                scroll_window(&backend, id, audio).await?;
                 // Allow Instagram's reel transition to finish between inputs.
                 tokio::time::sleep(Duration::from_millis(900)).await;
             }
@@ -400,7 +446,7 @@ async fn scroll_reels(config: Config, environment: Environment) -> Result<(), St
 
     for step in 1..=config.count {
         for id in &ids {
-            scroll_window(&backend, id).await?;
+            scroll_window(&backend, id, audio).await?;
         }
         println!(
             "Scroll pass {step}/{} across {} window(s)",
