@@ -113,6 +113,23 @@ All newly opened windows use Firefox's normal profile and Instagram login. They 
 
 Staggering changes the positions in those feeds. It does **not** create independent recommendation histories or guarantee different videos. Separate accounts in separate Firefox profiles can develop different recommendations, but this program does not manage those profiles or accounts.
 
+## Architecture
+
+The CLI starts the application layer in `src/app.rs`. The shared engine in
+`src/engine.rs` coordinates browser acquisition, tiling checks, startup timing,
+stagger offsets, scrolling, optional audio, and error propagation through small
+interfaces. `src/browser/firefox.rs` owns Firefox launch and window discovery;
+`src/platform/kde_wayland.rs` owns KWin scripting, `qdbus6`, and the single
+wdotool input session. `src/layout.rs` contains the grid and rectangle checks
+used by both the engine and the KWin layout script. Audio and stop signaling
+have their own modules, with KDE shortcut registration in `src/stop_key.rs`.
+
+KDE Plasma 6 on Wayland with Firefox remains the only supported combination.
+The boundaries make another browser adapter possible without changing the
+scroll schedule: a future adapter would supply its own launch, discovery,
+readiness, and metadata behavior through the browser interface. This does not
+add support for another browser or desktop today.
+
 ## If something goes wrong
 
 ### Windows still overlap
@@ -142,9 +159,10 @@ That is the desktop portal announcing the input permission this program uses. On
 ## Development checks
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+rtk cargo fmt --all -- --check
+rtk cargo clippy --all-targets -- -D warnings
+rtk cargo test
+rtk cargo build --release --locked
 ```
 
 The KDE shortcut integration test is ignored by default because it needs a live desktop session. Run it separately when no other copy of the scroller is running:
@@ -169,4 +187,6 @@ cargo test live_reels_speaker_unmutes_with_pointer_input -- --ignored
 
 Run desktop integration tests one at a time so they do not change the shared accessibility setting during another test.
 
-The implementation lives in [`src/main.rs`](src/main.rs); the global stop shortcut and D-Bus receiver live in [`src/stop_key.rs`](src/stop_key.rs). Optional audio detection lives in [`src/audio.rs`](src/audio.rs).
+The app entry point is [`src/main.rs`](src/main.rs). Module boundaries and the
+manual live-desktop regression checklist are documented in
+[`docs/architecture.md`](docs/architecture.md).

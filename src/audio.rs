@@ -4,8 +4,64 @@ use std::{
     time::Duration,
 };
 
-use wdotool_core::{DynBackend, KeyDirection, MouseButton, WindowGeometry};
 use zbus::{zvariant::OwnedObjectPath, Connection, Proxy};
+
+use crate::{
+    layout::LogicalRect,
+    platform::{ButtonState, Platform, PointerButton, WindowHandle},
+};
+
+#[allow(async_fn_in_trait)]
+pub trait AudioHandler<P: Platform>: Send + Sync {
+    fn enabled(&self) -> bool;
+
+    async fn unmute(&self, platform: &P, window: &WindowHandle, bounds: &LogicalRect);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoAudio;
+
+impl<P: Platform> AudioHandler<P> for NoAudio {
+    fn enabled(&self) -> bool {
+        false
+    }
+
+    async fn unmute(&self, _platform: &P, _window: &WindowHandle, _bounds: &LogicalRect) {}
+}
+
+pub enum AudioMode {
+    Disabled,
+    Enabled(AudioControl),
+}
+
+impl AudioMode {
+    pub async fn initialize(enabled: bool) -> Result<Self, String> {
+        if enabled {
+            AudioControl::new().await.map(Self::Enabled)
+        } else {
+            Ok(Self::Disabled)
+        }
+    }
+
+    pub async fn restore(&self) -> Result<(), String> {
+        match self {
+            Self::Disabled => Ok(()),
+            Self::Enabled(audio) => audio.restore().await,
+        }
+    }
+}
+
+impl<P: Platform> AudioHandler<P> for AudioMode {
+    fn enabled(&self) -> bool {
+        matches!(self, Self::Enabled(_))
+    }
+
+    async fn unmute(&self, platform: &P, window: &WindowHandle, bounds: &LogicalRect) {
+        if let Self::Enabled(audio) = self {
+            audio.unmute(platform, window, bounds).await;
+        }
+    }
+}
 
 type Node = (String, OwnedObjectPath);
 type Rect = (i32, i32, i32, i32);
@@ -113,8 +169,8 @@ impl AudioControl {
 
     async fn ensure_unmuted(
         &self,
-        backend: &DynBackend,
-        bounds: &WindowGeometry,
+        platform: &impl Platform,
+        bounds: &LogicalRect,
     ) -> Result<(), String> {
         let frame = self.active_frame().await?;
         if let Some((slider, (x, y, width, height))) = self.volume_icon(&frame, bounds).await? {
@@ -124,17 +180,21 @@ impl AudioControl {
             // Firefox exposes Instagram's speaker icon as a tiny volume slider.
             // Read its state, but send an ordinary mouse click: changing the
             // native accessibility Value property can crash Firefox.
-            backend
-                .mouse_move(x + width / 2, y + height / 2, true)
+            let click_x = i32::try_from(i64::from(x) + i64::from(width / 2))
+                .map_err(|_| "the speaker position exceeds the pointer coordinate range")?;
+            let click_y = i32::try_from(i64::from(y) + i64::from(height / 2))
+                .map_err(|_| "the speaker position exceeds the pointer coordinate range")?;
+            platform
+                .move_pointer(click_x, click_y)
                 .await
                 .map_err(|e| e.to_string())?;
             tokio::time::sleep(Duration::from_millis(80)).await;
-            backend
-                .mouse_button(MouseButton::Left, KeyDirection::Press)
+            platform
+                .pointer_button(PointerButton::Left, ButtonState::Press)
                 .await
                 .map_err(|e| e.to_string())?;
-            backend
-                .mouse_button(MouseButton::Left, KeyDirection::Release)
+            platform
+                .pointer_button(PointerButton::Left, ButtonState::Release)
                 .await
                 .map_err(|e| e.to_string())?;
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -173,7 +233,7 @@ impl AudioControl {
     async fn volume_icon(
         &self,
         frame: &Node,
-        bounds: &WindowGeometry,
+        bounds: &LogicalRect,
     ) -> Result<Option<VolumeIcon>, String> {
         let frame_component = Proxy::new(
             &self.bus,
@@ -310,22 +370,45 @@ impl AudioControl {
         }
     }
 
-    pub async fn unmute(&self, backend: &DynBackend, window: &str, bounds: &WindowGeometry) {
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), self.ensure_unmuted(backend, bounds))
-                .await
-                .unwrap_or_else(|_| Err("Firefox's audio control lookup timed out".into()));
+    pub async fn unmute<P: Platform>(
+        &self,
+        platform: &P,
+        window: &WindowHandle,
+        bounds: &LogicalRect,
+    ) {
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ensure_unmuted(platform, bounds),
+        )
+        .await
+        .unwrap_or_else(|_| Err("Firefox's audio control lookup timed out".into()));
         if let Err(error) = result {
-            if self.warned.lock().unwrap().insert(window.to_owned()) {
+            if self
+                .warned
+                .lock()
+                .unwrap()
+                .insert(window.as_str().to_owned())
+            {
                 eprintln!(
-                    "Auto-unmute skipped for window {window}: {error}. Scrolling will continue."
+                    "Auto-unmute skipped for window {}: {error}. Scrolling will continue.",
+                    window.as_str()
                 );
             }
         }
     }
 }
 
-fn window_icon_rect((x, y, width, height): Rect, bounds: &WindowGeometry) -> Option<Rect> {
+impl<P: Platform> AudioHandler<P> for AudioControl {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    async fn unmute(&self, platform: &P, window: &WindowHandle, bounds: &LogicalRect) {
+        AudioControl::unmute(self, platform, window, bounds).await;
+    }
+}
+
+fn window_icon_rect((x, y, width, height): Rect, bounds: &LogicalRect) -> Option<Rect> {
     // Translate a validated window-relative icon into compositor coordinates.
     let valid = (1..=96).contains(&width)
         && (1..=96).contains(&height)
@@ -335,8 +418,8 @@ fn window_icon_rect((x, y, width, height): Rect, bounds: &WindowGeometry) -> Opt
         && y as i64 + height as i64 <= bounds.height as i64;
     if valid {
         Some((
-            bounds.x.saturating_add(x),
-            bounds.y.saturating_add(y),
+            bounds.x.checked_add(x)?,
+            bounds.y.checked_add(y)?,
             width,
             height,
         ))
@@ -348,14 +431,14 @@ fn window_icon_rect((x, y, width, height): Rect, bounds: &WindowGeometry) -> Opt
 fn screen_icon_rect(
     (x, y, width, height): Rect,
     (frame_x, frame_y, _, _): Rect,
-    bounds: &WindowGeometry,
+    bounds: &LogicalRect,
 ) -> Option<Rect> {
     // Firefox retains its own window origin on Wayland. Normalize within that
     // coordinate system, then translate to KWin's actual compositor position.
     window_icon_rect(
         (
-            x.saturating_sub(frame_x),
-            y.saturating_sub(frame_y),
+            x.checked_sub(frame_x)?,
+            y.checked_sub(frame_y)?,
             width,
             height,
         ),
@@ -390,12 +473,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "physically clicks the last open Firefox Instagram window; requires KDE Wayland"]
     async fn live_reels_speaker_unmutes_with_pointer_input() {
-        use wdotool_core::backend::detector::{self, BackendKind, Environment};
-        let environment = Environment::detect();
-        let backend = detector::build(&environment, Some(BackendKind::KdeDBus))
+        use crate::platform::{
+            kde_wayland::{KdeCleanupQueue, KdeEnvironment, KdeWaylandPlatform},
+            Platform,
+        };
+        let environment = KdeEnvironment::detect().unwrap();
+        let platform = KdeWaylandPlatform::connect(&environment, KdeCleanupQueue::default())
             .await
             .unwrap();
-        let window = backend
+        let window = platform
             .list_windows()
             .await
             .unwrap()
@@ -410,12 +496,16 @@ mod tests {
             })
             .expect("open a Reels page before running this test");
         let audio = AudioControl::new().await.unwrap();
-        backend.activate_window(&window.id).await.unwrap();
+        platform.activate_window(&window.handle).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let geometry = backend.window_geometry(&window.id).await.unwrap().unwrap();
+        let geometry = platform
+            .window_geometry(&window.handle)
+            .await
+            .unwrap()
+            .unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(8),
-            audio.ensure_unmuted(&backend, &geometry),
+            audio.ensure_unmuted(&platform, &geometry),
         )
         .await;
         audio.restore().await.unwrap();
@@ -425,7 +515,7 @@ mod tests {
 
     #[test]
     fn speaker_coordinates_include_kde_panel_and_tiled_window_origin() {
-        let bounds = WindowGeometry {
+        let bounds = LogicalRect {
             x: 0,
             y: 36,
             width: 1920,
@@ -435,7 +525,7 @@ mod tests {
             window_icon_rect((1175, 984, 28, 28), &bounds),
             Some((1175, 1020, 28, 28))
         );
-        let tiled = WindowGeometry {
+        let tiled = LogicalRect {
             x: 960,
             y: 36,
             width: 960,
