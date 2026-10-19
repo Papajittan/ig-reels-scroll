@@ -38,10 +38,12 @@ cargo build --release --locked
 Sign into Instagram in Firefox first. Then run:
 
 ```bash
-./target/release/ig-reels-scroll --windows 2 --count 20 --interval 3
+./target/release/ig-reels-scroll --windows 2 --interval 3
 ```
 
-The program registers the stop key, opens the windows, and tiles them. It then waits **8 seconds** for you to dismiss any Instagram dialogs before applying the starting offsets and beginning the regular scroll passes.
+By default, scrolling continues until you press **X** or **Ctrl-C**. The program registers the stop key, opens the windows, and tiles them. It then waits **8 seconds** for you to dismiss any Instagram dialogs before applying the starting offsets and beginning the regular scroll passes.
+
+For a finite run, set `--count`, for example `--count 20` to perform 20 passes.
 
 Press **X anywhere** to stop. Firefox windows remain open.
 
@@ -58,7 +60,7 @@ cargo run -- --windows 2 --stagger 5
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--windows N` | `1` | Number of Firefox windows, from 1 to 16. |
-| `--count N` | `20` | Number of regular scroll passes. Each pass scrolls every selected window once. Must be positive. |
+| `--count N` | Unlimited | Number of regular scroll passes. Each pass scrolls every selected window once. Must be positive; omit it to continue until stopped. |
 | `--interval SECONDS` | `3` | Pause between completed passes. Accepts decimals; minimum is 0.2 seconds. |
 | `--stagger N` | `5` | Extra starting scroll steps per window index, from 0 to 100. Use 0 to disable. |
 | `--no-open` | Off | Use existing Firefox windows instead of opening new ones. |
@@ -66,7 +68,7 @@ cargo run -- --windows 2 --stagger 5
 | `--no-unmute` | On | Leave audio unchanged. This is the default; the last audio flag wins. |
 | `--help` | | Show usage and exit. |
 
-`--interval` is the pause between passes, not an exact timer for each reel. Focusing windows and sending input takes additional time. Starting offsets happen before the counted passes.
+`--interval` is the pause between passes, not an exact timer for each reel. Focusing windows and sending input takes additional time. Starting offsets happen before the regular passes.
 
 ### Automatic unmuting
 

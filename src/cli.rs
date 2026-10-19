@@ -3,7 +3,7 @@ use std::time::Duration;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub windows: usize,
-    pub count: u32,
+    pub count: Option<u32>,
     pub interval: Duration,
     pub open_browser: bool,
     pub stagger: u32,
@@ -20,7 +20,8 @@ pub fn usage(program: &str) -> String {
     format!(
         "Usage: {program} [--windows N] [--count N] [--interval SECONDS] [--stagger N] [--no-open] [--unmute | --no-unmute]\n\
          KDE Plasma Wayland: tile N Firefox Reels windows and scroll each one.\n\
-         Defaults: 1 window, 20 scroll passes, 3 seconds apart, 5 extra starting scrolls per window.\n\
+         Defaults: 1 window, unlimited scroll passes, 3 seconds apart, 5 extra starting scrolls per window.\n\
+         Use --count N for a finite run. Omit it to continue until stopped.\n\
          Press X anywhere or Ctrl-C in the terminal to stop. --stagger 0 disables starting offsets.\n\
          --unmute enables automatic unmuting; otherwise audio is left unchanged."
     )
@@ -33,7 +34,7 @@ where
     S: Into<String>,
 {
     let mut windows = 1_usize;
-    let mut count = 20_u32;
+    let mut count = None;
     let mut interval_secs = 3.0_f64;
     let mut open_browser = true;
     let mut stagger = 5_u32;
@@ -54,14 +55,15 @@ where
                 }
             }
             "--count" => {
-                count = args
+                let parsed_count = args
                     .next()
                     .ok_or("--count needs a number")?
                     .parse()
                     .map_err(|_| "--count must be a positive integer")?;
-                if count == 0 {
+                if parsed_count == 0 {
                     return Err("--count must be greater than zero".into());
                 }
+                count = Some(parsed_count);
             }
             "--interval" => {
                 interval_secs = args
@@ -117,13 +119,26 @@ mod tests {
             parse(&["ig-reels-scroll"]).unwrap(),
             ParseOutcome::Run(Config {
                 windows: 1,
-                count: 20,
+                count: None,
                 interval: Duration::from_secs(3),
                 open_browser: true,
                 stagger: 5,
                 unmute: false,
             })
         );
+        for (args, count) in [
+            (&["ig-reels-scroll", "--count", "1"][..], Some(1)),
+            (&["ig-reels-scroll", "--count", "20"][..], Some(20)),
+            (
+                &["ig-reels-scroll", "--count", "4294967295"][..],
+                Some(u32::MAX),
+            ),
+        ] {
+            assert!(matches!(
+                parse(args),
+                Ok(ParseOutcome::Run(Config { count: actual, .. })) if actual == count
+            ));
+        }
         for args in [
             &["ig-reels-scroll", "--windows", "2"][..],
             &["ig-reels-scroll", "--windows", "4", "--count", "20"][..],
@@ -155,6 +170,14 @@ mod tests {
             (
                 &["app", "--count", "0"][..],
                 "--count must be greater than zero",
+            ),
+            (
+                &["app", "--count", "-1"][..],
+                "--count must be a positive integer",
+            ),
+            (
+                &["app", "--count", "4294967296"][..],
+                "--count must be a positive integer",
             ),
             (
                 &["app", "--interval", "0.1"][..],

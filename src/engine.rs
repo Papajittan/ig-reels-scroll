@@ -75,20 +75,28 @@ where
         }
     }
 
-    for step in 1..=config.count {
+    let mut step = 0_u64;
+    while config.count.is_none_or(|count| step < u64::from(count)) {
         for window in &windows {
             scroll_window(platform, window, audio).await?;
         }
-        println!(
-            "Scroll pass {step}/{} across {} window(s)",
-            config.count,
-            windows.len()
-        );
-        if step < config.count {
-            tokio::time::sleep(config.interval).await;
+        step = step.saturating_add(1);
+        if let Some(count) = config.count {
+            println!(
+                "Scroll pass {step}/{count} across {} window(s)",
+                windows.len()
+            );
+            if step >= u64::from(count) {
+                break;
+            }
+        } else {
+            println!("Scroll pass {step} across {} window(s)", windows.len());
         }
+        tokio::time::sleep(config.interval).await;
     }
-    println!("Done.");
+    if config.count.is_some() {
+        println!("Done.");
+    }
     Ok(())
 }
 
@@ -374,7 +382,7 @@ mod tests {
         )
     }
 
-    fn config(windows: usize, count: u32, interval: Duration, stagger: u32) -> Config {
+    fn config(windows: usize, count: Option<u32>, interval: Duration, stagger: u32) -> Config {
         Config {
             windows,
             count,
@@ -383,6 +391,10 @@ mod tests {
             stagger,
             unmute: false,
         }
+    }
+
+    fn finite_config(windows: usize, count: u32, interval: Duration, stagger: u32) -> Config {
+        config(windows, Some(count), interval, stagger)
     }
 
     async fn finish_paused<T>(task: tokio::task::JoinHandle<T>) -> T {
@@ -412,7 +424,7 @@ mod tests {
         let (platform, browser, events) = fixtures(2, false, None);
         let task = tokio::spawn(async move {
             run(
-                &config(2, 1, Duration::from_secs(3), 0),
+                &finite_config(2, 1, Duration::from_secs(3), 0),
                 &platform,
                 &browser,
                 &NoAudio,
@@ -453,7 +465,7 @@ mod tests {
         ) {
             let events = Arc::clone(&platform.events);
             let result = run(
-                &config(2, 1, Duration::from_secs(3), 0),
+                &finite_config(2, 1, Duration::from_secs(3), 0),
                 &platform,
                 &browser,
                 &NoAudio,
@@ -523,7 +535,7 @@ mod tests {
         let start = Instant::now();
         let task = tokio::spawn(async move {
             run(
-                &config(1, 2, Duration::from_secs(3), 0),
+                &finite_config(1, 2, Duration::from_secs(3), 0),
                 &platform,
                 &browser,
                 &NoAudio,
@@ -545,7 +557,7 @@ mod tests {
         let start = Instant::now();
         let task = tokio::spawn(async move {
             run(
-                &config(1, 1, Duration::from_secs(3), 0),
+                &finite_config(1, 1, Duration::from_secs(3), 0),
                 &platform,
                 &browser,
                 &NoAudio,
@@ -558,11 +570,69 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn unlimited_schedule_passes_twenty_and_keeps_the_interval() {
+        let (platform, browser, events) = fixtures(1, false, None);
+        let task = tokio::spawn(async move {
+            run(
+                &config(1, None, Duration::from_secs(3), 0),
+                &platform,
+                &browser,
+                &NoAudio,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(STARTUP_DELAY).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        for expected in 1..=21 {
+            if expected > 1 {
+                tokio::time::advance(Duration::from_secs(2)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|event| event.starts_with("scroll:"))
+                        .count(),
+                    expected - 1,
+                    "the next pass must wait for its configured interval"
+                );
+                tokio::time::advance(Duration::from_secs(1)).await;
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            tokio::time::advance(ACTIVATION_SETTLE).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event.starts_with("scroll:"))
+                    .count(),
+                expected
+            );
+        }
+        assert!(!task.is_finished(), "unlimited runs must remain active");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn activation_geometry_pointer_and_scroll_are_ordered_per_window() {
         let (platform, browser, events) = fixtures(1, false, None);
         let task = tokio::spawn(async move {
             run(
-                &config(1, 1, Duration::from_secs(3), 0),
+                &finite_config(1, 1, Duration::from_secs(3), 0),
                 &platform,
                 &browser,
                 &NoAudio,
@@ -597,7 +667,7 @@ mod tests {
         let (platform, browser, events) = fixtures(1, false, None);
         let (cancel, mut receiver) = watch::channel(false);
         let task = tokio::spawn(async move {
-            let settings = config(1, 1, Duration::from_secs(3), 0);
+            let settings = finite_config(1, 1, Duration::from_secs(3), 0);
             tokio::select! {
                 biased;
                 _ = receiver.wait_for(|cancelled| *cancelled) => Ok(()),
@@ -624,7 +694,7 @@ mod tests {
         let (platform, browser, events) = fixtures(1, false, None);
         let (cancel, mut receiver) = watch::channel(false);
         let task = tokio::spawn(async move {
-            let settings = config(1, 2, Duration::from_secs(3), 0);
+            let settings = config(1, None, Duration::from_secs(3), 0);
             tokio::select! {
                 biased;
                 _ = receiver.wait_for(|cancelled| *cancelled) => Ok(()),
@@ -667,7 +737,7 @@ mod tests {
         let (platform, browser, events) = fixtures(2, false, None);
         let (cancel, mut receiver) = watch::channel(false);
         let task = tokio::spawn(async move {
-            let settings = config(2, 1, Duration::from_secs(3), 1);
+            let settings = finite_config(2, 1, Duration::from_secs(3), 1);
             tokio::select! {
                 biased;
                 _ = receiver.wait_for(|cancelled| *cancelled) => Ok(()),
@@ -712,7 +782,7 @@ mod tests {
         let (platform, browser, events) = fixtures(1, false, Some("activate"));
         let task = tokio::spawn(async move {
             run(
-                &config(1, 1, Duration::from_secs(3), 0),
+                &finite_config(1, 1, Duration::from_secs(3), 0),
                 &platform,
                 &browser,
                 &NoAudio,
@@ -732,7 +802,7 @@ mod tests {
         let (platform, browser, events) = fixtures(2, true, None);
         let task = tokio::spawn(async move {
             run(
-                &config(2, 1, Duration::from_secs(3), 0),
+                &finite_config(2, 1, Duration::from_secs(3), 0),
                 &platform,
                 &browser,
                 &NoAudio,
@@ -762,7 +832,7 @@ mod tests {
         let (platform, browser, events) = fixtures(1, false, None);
         let task = tokio::spawn(async move {
             run(
-                &config(1, 1, Duration::from_secs(3), 0),
+                &finite_config(1, 1, Duration::from_secs(3), 0),
                 &platform,
                 &browser,
                 &NoAudio,
@@ -783,7 +853,7 @@ mod tests {
         };
         let task = tokio::spawn(async move {
             run(
-                &config(1, 1, Duration::from_secs(3), 0),
+                &finite_config(1, 1, Duration::from_secs(3), 0),
                 &platform,
                 &browser,
                 &audio,
