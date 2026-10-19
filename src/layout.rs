@@ -59,7 +59,7 @@ impl GridSpec {
 
     pub fn cells(self, work_area: LogicalRect) -> Result<Vec<LogicalRect>, String> {
         if !work_area.is_valid() {
-            return Err("KWin returned an invalid work area".into());
+            return Err("layout work area is invalid".into());
         }
         (0..self.count)
             .map(|index| {
@@ -78,21 +78,6 @@ impl GridSpec {
             })
             .collect()
     }
-
-    /// Return the integer partition expression used by the KWin JavaScript.
-    pub fn js_partition(self, axis: GridAxis, boundary: &str) -> String {
-        let (dimension, divisions) = match axis {
-            GridAxis::Horizontal => ("area.width", self.columns),
-            GridAxis::Vertical => ("area.height", self.rows),
-        };
-        format!("Math.floor({boundary} * {dimension} / {divisions})")
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GridAxis {
-    Horizontal,
-    Vertical,
 }
 
 pub fn has_overlaps(rectangles: &[LogicalRect]) -> bool {
@@ -224,6 +209,37 @@ mod tests {
     }
 
     #[test]
+    fn grid_cells_match_the_original_floor_partition_at_edge_sizes() {
+        let original_partition = |dimension: u32, boundary: u32, divisions: u32| {
+            ((u64::from(boundary) * u64::from(dimension)) / u64::from(divisions)) as u32
+        };
+        for (width, height) in [(1, 1), (2731, 1517), (2560, 1440)] {
+            let area = LogicalRect {
+                x: -1920,
+                y: 37,
+                width,
+                height,
+            };
+            for count in 1..=16 {
+                let grid = GridSpec::for_count(count).unwrap();
+                let cells = grid.cells(area).unwrap();
+                for (index, cell) in cells.into_iter().enumerate() {
+                    let column = index as u32 % grid.columns;
+                    let row = index as u32 / grid.columns;
+                    let x_start = original_partition(width, column, grid.columns);
+                    let x_end = original_partition(width, column + 1, grid.columns);
+                    let y_start = original_partition(height, row, grid.rows);
+                    let y_end = original_partition(height, row + 1, grid.rows);
+                    assert_eq!(cell.x, area.x + x_start as i32);
+                    assert_eq!(cell.y, area.y + y_start as i32);
+                    assert_eq!(cell.width, x_end - x_start);
+                    assert_eq!(cell.height, y_end - y_start);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn geometry_centers_and_viewport_scroll_use_logical_pixels() {
         let geometry = LogicalRect {
             x: 100,
@@ -249,19 +265,6 @@ mod tests {
             }
             .center(),
             None
-        );
-    }
-
-    #[test]
-    fn javascript_uses_the_same_grid_partition_as_rust_geometry() {
-        let grid = GridSpec::for_count(5).unwrap();
-        assert_eq!(
-            grid.js_partition(GridAxis::Horizontal, "column"),
-            "Math.floor(column * area.width / 3)"
-        );
-        assert_eq!(
-            grid.js_partition(GridAxis::Vertical, "row"),
-            "Math.floor(row * area.height / 2)"
         );
     }
 }

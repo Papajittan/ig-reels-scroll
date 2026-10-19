@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use crate::{
     audio::AudioHandler,
@@ -31,7 +31,7 @@ where
     let selected = browser
         .acquire_windows(platform, config.windows, config.open_browser)
         .await?;
-    let windows: Vec<_> = selected.into_iter().map(|window| window.handle).collect();
+    let windows = validate_selected_windows(selected, config.windows)?;
     let layout = GridSpec::for_count(windows.len())?;
 
     if config.open_browser {
@@ -92,6 +92,33 @@ where
     Ok(())
 }
 
+/// Browser adapters must return exactly the requested number of distinct,
+/// non-empty window handles before the engine sends any desktop input.
+fn validate_selected_windows<M>(
+    selected: Vec<crate::browser::BrowserWindow<M>>,
+    expected_count: usize,
+) -> Result<Vec<WindowHandle>, String> {
+    if selected.len() != expected_count {
+        return Err(format!(
+            "browser adapter returned {} window(s), expected {expected_count}",
+            selected.len()
+        ));
+    }
+
+    let mut identities = HashSet::with_capacity(selected.len());
+    for window in &selected {
+        let identity = window.handle.as_str();
+        if identity.trim().is_empty() {
+            return Err("browser adapter returned an empty window handle".into());
+        }
+        if !identities.insert(identity) {
+            return Err("browser adapter returned duplicate window handles".into());
+        }
+    }
+
+    Ok(selected.into_iter().map(|window| window.handle).collect())
+}
+
 pub fn starting_offset(index: usize, stagger: u32) -> u32 {
     index as u32 * stagger
 }
@@ -120,14 +147,14 @@ async fn confirm_layout<P: Platform>(
             return Ok(());
         }
         if attempt % LAYOUT_RETRY_EVERY == LAYOUT_RETRY_EVERY - 1 {
-            // A late Firefox restore can replace an earlier resize.
+            // A late window restore can replace an earlier resize.
             platform
                 .arrange_windows(windows, layout, LayoutPass::Place)
                 .await?;
         }
         tokio::time::sleep(LAYOUT_RETRY_DELAY).await;
     }
-    Err("KWin did not tile the Firefox windows: they still overlap. Scrolling stopped.".into())
+    Err("Selected windows still overlap after layout retries. Scrolling stopped.".into())
 }
 
 async fn get_geometry<P: Platform>(
@@ -137,7 +164,7 @@ async fn get_geometry<P: Platform>(
     platform
         .window_geometry(window)
         .await?
-        .ok_or_else(|| "KWin did not provide Firefox window geometry".into())
+        .ok_or_else(|| "Could not read selected window geometry".into())
 }
 
 async fn scroll_window<P, A>(platform: &P, window: &WindowHandle, audio: &A) -> Result<(), String>
@@ -150,10 +177,9 @@ where
     let geometry = get_geometry(platform, window).await?;
     let (x, y) = geometry
         .center()
-        .ok_or("Firefox window center is outside supported coordinate range")?;
+        .ok_or("Selected window center is outside the supported coordinate range")?;
     platform.move_pointer(x, y).await?;
-    // libei uses logical pixels, not mouse-wheel click counts. Scroll roughly
-    // one content viewport so a step advances the feed naturally.
+    // Scroll roughly one content viewport so a step advances the feed naturally.
     platform.scroll(0.0, geometry.scroll_distance()).await?;
     if audio.enabled() {
         tokio::time::sleep(POST_SCROLL_AUDIO_SETTLE).await;
@@ -183,6 +209,8 @@ mod tests {
     struct FakeBrowser {
         windows: Vec<BrowserWindow<TestMetadata>>,
         events: Arc<Mutex<Vec<String>>>,
+        acquisition_error: Option<&'static str>,
+        return_all: bool,
     }
 
     impl BrowserAdapter for FakeBrowser {
@@ -208,7 +236,14 @@ mod tests {
             _open_browser: bool,
         ) -> Result<Vec<BrowserWindow<Self::Metadata>>, String> {
             self.events.lock().unwrap().push("acquire".into());
-            Ok(self.windows.iter().take(count).cloned().collect())
+            if let Some(error) = self.acquisition_error {
+                return Err(error.into());
+            }
+            Ok(if self.return_all {
+                self.windows.clone()
+            } else {
+                self.windows.iter().take(count).cloned().collect()
+            })
         }
     }
 
@@ -332,6 +367,8 @@ mod tests {
             FakeBrowser {
                 windows: browser_windows,
                 events: events.clone(),
+                acquisition_error: None,
+                return_all: false,
             },
             events,
         )
@@ -405,6 +442,79 @@ mod tests {
         assert!(
             acquire < restore && restore < place && place < geometry && geometry < first_scroll
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_window_acquisition_stops_before_platform_manipulation() {
+        async fn assert_rejected(
+            platform: FakePlatform,
+            browser: FakeBrowser,
+            expected_error: &str,
+        ) {
+            let events = Arc::clone(&platform.events);
+            let result = run(
+                &config(2, 1, Duration::from_secs(3), 0),
+                &platform,
+                &browser,
+                &NoAudio,
+            )
+            .await;
+            assert_eq!(result.unwrap_err(), expected_error);
+            assert_eq!(*events.lock().unwrap(), ["acquire"]);
+        }
+
+        let (platform, mut browser, _) = fixtures(2, false, None);
+        browser.windows.truncate(1);
+        assert_rejected(
+            platform,
+            browser,
+            "browser adapter returned 1 window(s), expected 2",
+        )
+        .await;
+
+        let (platform, mut browser, _) = fixtures(2, false, None);
+        browser.windows.clear();
+        assert_rejected(
+            platform,
+            browser,
+            "browser adapter returned 0 window(s), expected 2",
+        )
+        .await;
+
+        let (platform, mut browser, _) = fixtures(2, false, None);
+        browser.windows[1].handle = browser.windows[0].handle.clone();
+        assert_rejected(
+            platform,
+            browser,
+            "browser adapter returned duplicate window handles",
+        )
+        .await;
+
+        let (platform, mut browser, _) = fixtures(2, false, None);
+        browser.windows[0].handle = WindowHandle::new("  ");
+        assert_rejected(
+            platform,
+            browser,
+            "browser adapter returned an empty window handle",
+        )
+        .await;
+
+        let (platform, mut browser, _) = fixtures(2, false, None);
+        browser.windows.push(BrowserWindow {
+            handle: WindowHandle::new("extra-window"),
+            metadata: TestMetadata,
+        });
+        browser.return_all = true;
+        assert_rejected(
+            platform,
+            browser,
+            "browser adapter returned 3 window(s), expected 2",
+        )
+        .await;
+
+        let (platform, mut browser, _) = fixtures(2, false, None);
+        browser.acquisition_error = Some("adapter acquisition failed");
+        assert_rejected(platform, browser, "adapter acquisition failed").await;
     }
 
     #[tokio::test(start_paused = true)]

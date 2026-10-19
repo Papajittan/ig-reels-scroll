@@ -8,21 +8,40 @@ promises that other platforms or browsers already work.
 
 - `app.rs` parses process arguments, checks the supported environment, builds
   runtime dependencies, races the engine with X and Ctrl-C, then restores audio
-  accessibility and stop-key resources.
+  accessibility and stop-key resources. Accessibility restoration is bounded
+  to five seconds; cleanup errors are reported with uncertain remote state
+  called out explicitly.
 - `cli.rs` parses an argument iterator into validated configuration. It has no
   process or desktop access.
 - `engine.rs` runs browser acquisition, layout verification, startup delay,
   starting offsets, scroll passes, and optional audio hooks. It uses only the
-  browser, platform, layout, configuration, and audio interfaces.
+  browser, platform, layout, configuration, and audio interfaces. It checks
+  that adapters return exactly the requested number of unique, non-empty
+  handles before any window manipulation.
 - `browser/` owns browser identification, launch behavior, window readiness,
   and browser-specific metadata. Firefox is the only adapter.
 - `platform/` exposes opaque window handles, logical-pixel geometry, activation,
   layout, pointer movement, scrolling, and button input. `kde_wayland.rs` owns
-  environment detection, one wdotool backend session, KWin JavaScript, and
-  `qdbus6` cleanup.
+  environment detection, one `wdotool-core` 0.5.3 backend session, the
+  application's KWin JavaScript, and its direct `qdbus6` script operations.
+  Those owned qdbus children have a five-second operation limit, bounded output
+  readers, and explicit termination and reaping on timeout. The tracked layout
+  cleanup queue has a twenty-second total limit, and desktop accessibility
+  restoration has a five-second limit. Failures report that remote KWin state
+  is unconfirmed rather than claiming cleanup succeeded.
+- `wdotool-core` also performs its own KWin window operations. In version
+  0.5.3, it creates private transient scripts, calls KWin through its own D-Bus
+  connection, and performs private best-effort unload cleanup whose errors are
+  logged and swallowed rather than returned to this application. The owned
+  qdbus timeout and cleanup queue do not bound or confirm that dependency's
+  internal cleanup. If an operation is canceled after its D-Bus request was
+  sent, remote script state can remain unconfirmed even when all application
+  cleanup stages complete. This boundary is documented here; vendor code is
+  unchanged.
 - `layout.rs` calculates the current square-root grid, divides integer display
-  dimensions, and detects invalid or intersecting rectangles. KWin calculates
-  the active work area at run time and applies this same grid specification.
+  dimensions, and detects invalid or intersecting rectangles. The KDE backend
+  calculates equivalent JavaScript partition expressions when it applies the
+  grid to KWin's active work area.
 - `audio.rs` owns Firefox AT-SPI lookup, state-aware activation, and restoration
   of the previous desktop accessibility setting. `NoAudio` keeps the engine
   usable without accessibility setup.
@@ -40,7 +59,10 @@ Run these checks only in a KDE Plasma 6 Wayland session. They move the pointer,
 change window geometry, and may open Firefox windows. Sign into Instagram before
 checking feed movement.
 
-1. Close unrelated Firefox windows, open two Instagram Reels windows manually,
+1. Close all Firefox windows, then run
+   `cargo run -- --windows 2 --count 1 --stagger 0 --no-unmute`. Confirm that
+   two Firefox windows open, tile without overlap, wait eight seconds, and
+   scroll once. Close those windows, open two Instagram Reels windows manually,
    then run
    `cargo run -- --windows 2 --count 2 --interval 0.2 --stagger 1 --no-open --no-unmute`.
    `--no-open` uses the first N Firefox windows in KWin enumeration order, so

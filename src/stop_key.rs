@@ -1,8 +1,11 @@
-use std::{env, fs, path::PathBuf, time::Duration};
+use std::{env, fs, future::Future, path::PathBuf, time::Duration};
 
-use tokio::{process::Command, sync::watch, time::timeout};
+use tokio::{sync::watch, time::timeout};
 
-use crate::stop::{StopNotifier, StopReason, StopSignal};
+use crate::{
+    platform::kde_wayland::run_qdbus_command,
+    stop::{StopNotifier, StopReason, StopSignal},
+};
 
 const PLUGIN: &str = "ig_reels_stop_key";
 const ACTION: &str = "IGReelsScrollStop";
@@ -37,21 +40,24 @@ impl Drop for StopKey {
         if self.cleaned {
             return;
         }
-        let script_path = self.script_path.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(cleanup_resources(script_path));
-        } else {
-            let _ = fs::remove_file(&self.script_path);
-        }
+        eprintln!("Stop-key cleanup was skipped; KWin shortcut state may remain registered.");
+        let _ = fs::remove_file(&self.script_path);
     }
 }
 
 impl StopKey {
-    pub async fn cleanup(&mut self) {
+    pub async fn cleanup(&mut self) -> Result<(), String> {
         if !self.cleaned {
-            cleanup_resources(self.script_path.clone()).await;
+            let result = cleanup_resources_with(
+                &self._connection,
+                &QdbusStopKeyCommands,
+                self.script_path.clone(),
+            )
+            .await;
             self.cleaned = true;
+            result?;
         }
+        Ok(())
     }
 
     pub async fn install() -> Result<(Self, StopSignal), String> {
@@ -78,7 +84,7 @@ callDBus("{address}", "/Stop", "org.ig.ReelsScroll", "ready", registered);
 "#
         );
         // Clear stale registration left by a process that was forcibly killed.
-        let _ = run_command(
+        let _ = run_qdbus_command(
             "qdbus6",
             &[
                 "org.kde.KWin",
@@ -98,7 +104,7 @@ callDBus("{address}", "/Stop", "org.ig.ReelsScroll", "ready", registered);
             cleaned: false,
         };
         let installed = async {
-            let script_id = run_command(
+            let script_id = run_qdbus_command(
                 "qdbus6",
                 &[
                     "org.kde.KWin",
@@ -112,7 +118,7 @@ callDBus("{address}", "/Stop", "org.ig.ReelsScroll", "ready", registered);
             let script_id: u32 = script_id
                 .parse()
                 .map_err(|_| "KWin could not load the stop shortcut")?;
-            run_command(
+            run_qdbus_command(
                 "qdbus6",
                 &[
                     "org.kde.KWin",
@@ -149,68 +155,139 @@ callDBus("{address}", "/Stop", "org.ig.ReelsScroll", "ready", registered);
         }
         .await;
         if let Err(error) = installed {
-            guard.cleanup().await;
-            return Err(error);
+            return match guard.cleanup().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; stop-key cleanup also failed: {cleanup}")),
+            };
         }
         Ok((guard, signal))
     }
 }
 
-async fn cleanup_resources(script_path: PathBuf) {
-    let _ = run_command(
-        "qdbus6",
-        &[
-            "org.kde.KWin",
-            "/Scripting",
-            "org.kde.kwin.Scripting.unloadScript",
-            PLUGIN,
-        ],
-    )
-    .await;
-    let _ = run_command(
-        "qdbus6",
-        &[
-            "org.kde.kglobalaccel",
-            "/kglobalaccel",
-            "org.kde.KGlobalAccel.unregister",
-            "kwin",
-            ACTION,
-        ],
-    )
-    .await;
-    let _ = tokio::fs::remove_file(script_path).await;
+#[allow(clippy::manual_async_fn)]
+trait StopKeyCleanupCommands: Send + Sync {
+    fn unload(&self) -> impl Future<Output = Result<(), String>> + Send + '_;
+    fn unregister(&self) -> impl Future<Output = Result<(), String>> + Send + '_;
 }
 
-async fn run_command(program: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
-        .args(args)
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|error| format!("could not run {program}: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(if stderr.is_empty() {
-            format!("{program} {} failed", args.join(" "))
-        } else {
-            format!("{program}: {stderr}")
-        });
+struct QdbusStopKeyCommands;
+
+#[allow(clippy::manual_async_fn)]
+impl StopKeyCleanupCommands for QdbusStopKeyCommands {
+    fn unload(&self) -> impl Future<Output = Result<(), String>> + Send + '_ {
+        async {
+            run_qdbus_command(
+                "qdbus6",
+                &[
+                    "org.kde.KWin",
+                    "/Scripting",
+                    "org.kde.kwin.Scripting.unloadScript",
+                    PLUGIN,
+                ],
+            )
+            .await
+            .map(|_| ())
+        }
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+
+    fn unregister(&self) -> impl Future<Output = Result<(), String>> + Send + '_ {
+        async {
+            run_qdbus_command(
+                "qdbus6",
+                &[
+                    "org.kde.kglobalaccel",
+                    "/kglobalaccel",
+                    "org.kde.KGlobalAccel.unregister",
+                    "kwin",
+                    ACTION,
+                ],
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+}
+
+async fn cleanup_resources_with<K, C>(
+    callback_owner: &K,
+    commands: &C,
+    script_path: PathBuf,
+) -> Result<(), String>
+where
+    C: StopKeyCleanupCommands,
+{
+    let mut errors = Vec::new();
+    if let Err(error) = commands.unload().await {
+        errors.push(format!(
+            "could not unload the KWin stop-key script; remote cleanup is unconfirmed: {error}"
+        ));
+    }
+    if let Err(error) = commands.unregister().await {
+        errors.push(format!(
+            "could not unregister the KWin stop shortcut: {error}"
+        ));
+    }
+    if let Err(error) = tokio::fs::remove_file(&script_path).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            errors.push(format!(
+                "could not remove stop-key script {}: {error}",
+                script_path.display()
+            ));
+        }
+    }
+    // Keep the owning StopKey's callback endpoint borrowed through both remote
+    // cleanup requests so KWin can still call it while the script is removed.
+    let _ = callback_owner;
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+
+    struct MockCleanupCommands {
+        callback_live: Arc<AtomicBool>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl StopKeyCleanupCommands for MockCleanupCommands {
+        fn unload(&self) -> impl Future<Output = Result<(), String>> + Send + '_ {
+            async {
+                assert!(self.callback_live.load(Ordering::SeqCst));
+                self.events.lock().unwrap().push("unload");
+                Err("simulated unload failure".into())
+            }
+        }
+
+        fn unregister(&self) -> impl Future<Output = Result<(), String>> + Send + '_ {
+            async {
+                assert!(
+                    self.callback_live.load(Ordering::SeqCst),
+                    "callback owner must remain alive until after unregister"
+                );
+                self.events.lock().unwrap().push("unregister");
+                Ok(())
+            }
+        }
+    }
 
     async fn command(args: &[&str]) -> String {
-        run_command("qdbus6", args).await.unwrap()
+        run_qdbus_command("qdbus6", args).await.unwrap()
     }
 
     #[tokio::test]
     #[ignore = "requires a running KDE Wayland session"]
     async fn global_shortcut_calls_stop_and_unloads() {
-        let (guard, mut signal) = StopKey::install().await.unwrap();
+        let (mut guard, mut signal) = StopKey::install().await.unwrap();
         command(&[
             "org.kde.kglobalaccel",
             "/component/kwin",
@@ -224,7 +301,7 @@ mod tests {
                 .unwrap(),
             StopReason::EmergencyKey
         );
-        drop(guard);
+        guard.cleanup().await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if command(&[
@@ -254,5 +331,40 @@ mod tests {
             .await,
             "true"
         );
+    }
+
+    #[tokio::test]
+    async fn unload_failure_still_unregisters_while_callback_owner_is_alive() {
+        struct CallbackOwner(Arc<AtomicBool>);
+        impl Drop for CallbackOwner {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+
+        let callback_live = Arc::new(AtomicBool::new(true));
+        let owner = CallbackOwner(Arc::clone(&callback_live));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let commands = MockCleanupCommands {
+            callback_live: Arc::clone(&callback_live),
+            events: Arc::clone(&events),
+        };
+        let script_path = env::temp_dir().join(format!(
+            "ig_reels_stop_key_cleanup_{}.js",
+            std::process::id()
+        ));
+        fs::write(&script_path, "test script").unwrap();
+
+        let error = cleanup_resources_with(&owner, &commands, script_path.clone())
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("remote cleanup is unconfirmed"));
+        assert!(error.contains("simulated unload failure"));
+        assert_eq!(*events.lock().unwrap(), ["unload", "unregister"]);
+        assert!(!script_path.exists());
+        assert!(callback_live.load(Ordering::SeqCst));
+        drop(owner);
+        assert!(!callback_live.load(Ordering::SeqCst));
     }
 }

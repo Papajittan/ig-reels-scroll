@@ -2,22 +2,35 @@ use std::{
     env,
     future::Future,
     path::PathBuf,
+    process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use tokio::{process::Command, sync::oneshot, task::JoinHandle, time::sleep};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::{Child, Command},
+    sync::oneshot,
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
 use wdotool_core::{
     backend::detector::{self, BackendKind, Environment},
     DynBackend,
 };
 
 use crate::{
-    layout::{GridAxis, GridSpec, LogicalRect},
+    layout::{GridSpec, LogicalRect},
     platform::{ButtonState, LayoutPass, Platform, PlatformWindow, PointerButton, WindowHandle},
 };
 
 const LAYOUT_SETTLE: Duration = Duration::from_millis(500);
+const QDBUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const CHILD_TERMINATION_TIMEOUT: Duration = Duration::from_secs(1);
+const SCRIPT_OPERATION_TIMEOUT: Duration = Duration::from_secs(7);
+const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024;
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
+const ABORTED_TASK_WAIT: Duration = Duration::from_secs(1);
 type KWinTask = JoinHandle<Result<(), String>>;
 
 fn ensure_supported_environment(environment: &Environment) -> Result<(), String> {
@@ -55,15 +68,69 @@ impl KdeCleanupQueue {
         self.tasks.lock().unwrap().push(task);
     }
 
-    pub async fn finish(&self) {
-        loop {
-            let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
-            if tasks.is_empty() {
-                break;
+    pub async fn finish(&self) -> Result<(), String> {
+        self.finish_with_timeout(CLEANUP_TIMEOUT).await
+    }
+
+    async fn finish_with_timeout(&self, limit: Duration) -> Result<(), String> {
+        let mut tracked = std::mem::take(&mut *self.tasks.lock().unwrap());
+        let mut next = 0;
+        let mut errors = Vec::new();
+        let drain = async {
+            loop {
+                while next < tracked.len() {
+                    match (&mut tracked[next]).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => errors.push(error),
+                        Err(error) => errors.push(format!("KWin cleanup task failed: {error}")),
+                    }
+                    next += 1;
+                }
+
+                let queued = std::mem::take(&mut *self.tasks.lock().unwrap());
+                if queued.is_empty() {
+                    break;
+                }
+                tracked.extend(queued);
             }
-            for task in tasks {
-                let _ = task.await;
+        };
+
+        if timeout(limit, drain).await.is_err() {
+            tracked.extend(std::mem::take(&mut *self.tasks.lock().unwrap()));
+            let mut pending = Vec::new();
+            for (index, task) in tracked.iter_mut().enumerate().skip(next) {
+                if task.is_finished() {
+                    match (&mut *task).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => errors.push(error),
+                        Err(error) if error.is_cancelled() => {}
+                        Err(error) => errors.push(format!("KWin cleanup task failed: {error}")),
+                    }
+                } else {
+                    task.abort();
+                    pending.push(index);
+                }
             }
+            let wait_aborted = async {
+                for index in pending {
+                    match (&mut tracked[index]).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => errors.push(error),
+                        Err(error) if error.is_cancelled() => {}
+                        Err(error) => errors.push(format!("KWin cleanup task failed: {error}")),
+                    }
+                }
+            };
+            let _ = timeout(ABORTED_TASK_WAIT, wait_aborted).await;
+            errors.push(
+                "timed out waiting for KWin cleanup; remote script state is unconfirmed".into(),
+            );
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("KWin cleanup failed: {}", errors.join("; ")))
         }
     }
 }
@@ -111,7 +178,7 @@ impl Platform for KdeWaylandPlatform {
                     height: geometry.height,
                 })
             })
-            .map_err(|error| format!("could not read Firefox window geometry: {error}"))
+            .map_err(|error| format!("could not read window geometry: {error}"))
     }
 
     async fn activate_window(&self, window: &WindowHandle) -> Result<(), String> {
@@ -119,7 +186,7 @@ impl Platform for KdeWaylandPlatform {
         self.backend
             .activate_window(&id)
             .await
-            .map_err(|error| format!("could not focus Firefox window: {error}"))
+            .map_err(|error| format!("could not focus window: {error}"))
     }
 
     async fn arrange_windows(
@@ -189,10 +256,10 @@ fn layout_script(windows: &[WindowHandle], grid: GridSpec, pass: LayoutPass) -> 
         .join(", ");
     let count = windows.len();
     let restore_only = pass == LayoutPass::Restore;
-    let x_start = grid.js_partition(GridAxis::Horizontal, "column");
-    let x_end = grid.js_partition(GridAxis::Horizontal, "(column + 1)");
-    let y_start = grid.js_partition(GridAxis::Vertical, "row");
-    let y_end = grid.js_partition(GridAxis::Vertical, "(row + 1)");
+    let x_start = js_partition("column", "area.width", grid.columns);
+    let x_end = js_partition("(column + 1)", "area.width", grid.columns);
+    let y_start = js_partition("row", "area.height", grid.rows);
+    let y_end = js_partition("(row + 1)", "area.height", grid.rows);
     format!(
         r#"
 const count = {count};
@@ -227,13 +294,91 @@ if (targets.length === count) {{
     )
 }
 
-async fn run_command(program: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
+fn js_partition(boundary: &str, dimension: &str, divisions: u32) -> String {
+    format!("Math.floor({boundary} * {dimension} / {divisions})")
+}
+
+pub(crate) async fn run_qdbus_command(program: &str, args: &[&str]) -> Result<String, String> {
+    run_command_with_timeout(program, args, QDBUS_COMMAND_TIMEOUT).await
+}
+
+async fn run_command_with_timeout(
+    program: &str,
+    args: &[&str],
+    limit: Duration,
+) -> Result<String, String> {
+    let mut child = Command::new(program)
         .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .output()
-        .await
+        .spawn()
         .map_err(|error| format!("could not run {program}: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdout is piped for every owned command");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("stderr is piped for every owned command");
+    let (status, stdout, stderr) = match timeout(
+        limit,
+        wait_and_capture(&mut child, stdout, stderr),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(wait_error)) => {
+            let termination = terminate_and_reap(&mut child).await;
+            return Err(match termination {
+                Ok(()) => format!(
+                    "could not read {program} output or wait for completion: {wait_error}; child was terminated and reaped"
+                ),
+                Err(termination_error) => {
+                    format!("could not read {program} output or wait for completion: {wait_error}; {termination_error}")
+                }
+            });
+        }
+        Err(_) => {
+            let detail = match child.try_wait() {
+                Ok(Some(_)) => {
+                    "child had exited and was reaped, but its output pipes did not close before the deadline"
+                        .to_owned()
+                }
+                Ok(None) => match terminate_and_reap(&mut child).await {
+                    Ok(()) => "child was terminated and reaped".to_owned(),
+                    Err(error) => error,
+                },
+                Err(error) => match terminate_and_reap(&mut child).await {
+                    Ok(()) => format!(
+                        "child was terminated and reaped after checking its state failed: {error}"
+                    ),
+                    Err(termination) => {
+                        format!("could not check child state: {error}; {termination}")
+                    }
+                },
+            };
+            return Err(format!(
+                "{program} {} timed out after {:.1}s; {detail}; remote operation outcome is uncertain",
+                args.join(" "),
+                limit.as_secs_f64()
+            ));
+        }
+    };
+
+    if stdout.truncated || stderr.truncated {
+        return Err(format!(
+            "{program} output exceeded the {} byte capture limit",
+            MAX_CAPTURED_OUTPUT_BYTES
+        ));
+    }
+    let output = std::process::Output {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(if stderr.is_empty() {
@@ -243,6 +388,82 @@ async fn run_command(program: &str, args: &[&str]) -> Result<String, String> {
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn wait_and_capture(
+    child: &mut Child,
+    mut stdout: impl AsyncRead + Unpin,
+    mut stderr: impl AsyncRead + Unpin,
+) -> std::io::Result<(std::process::ExitStatus, CapturedOutput, CapturedOutput)> {
+    let mut stdout_output = CapturedOutput::new();
+    let mut stderr_output = CapturedOutput::new();
+    let mut stdout_buffer = [0; 4096];
+    let mut stderr_buffer = [0; 4096];
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    let mut status = None;
+
+    loop {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if status.is_some() && stdout_closed && stderr_closed {
+            return Ok((
+                status.take().expect("child exit status was checked above"),
+                stdout_output,
+                stderr_output,
+            ));
+        }
+
+        tokio::select! {
+            result = stdout.read(&mut stdout_buffer), if !stdout_closed => {
+                match result? {
+                    0 => stdout_closed = true,
+                    count => stdout_output.append(&stdout_buffer[..count]),
+                }
+            }
+            result = stderr.read(&mut stderr_buffer), if !stderr_closed => {
+                match result? {
+                    0 => stderr_closed = true,
+                    count => stderr_output.append(&stderr_buffer[..count]),
+                }
+            }
+            _ = sleep(Duration::from_millis(10)), if status.is_none() => {}
+        }
+    }
+}
+
+impl CapturedOutput {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(MAX_CAPTURED_OUTPUT_BYTES),
+            truncated: false,
+        }
+    }
+
+    fn append(&mut self, input: &[u8]) {
+        let available = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(self.bytes.len());
+        let captured = input.len().min(available);
+        self.bytes.extend_from_slice(&input[..captured]);
+        self.truncated |= captured < input.len();
+    }
+}
+
+async fn terminate_and_reap(child: &mut Child) -> Result<(), String> {
+    let kill_error = child.start_kill().err();
+    match timeout(CHILD_TERMINATION_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(format!("could not reap the owned child process: {error}")),
+        Err(_) => Err(match kill_error {
+            Some(error) => format!("could not confirm owned child termination or reaping: {error}"),
+            None => "timed out confirming owned child termination or reaping".into(),
+        }),
+    }
 }
 
 #[allow(clippy::manual_async_fn)]
@@ -273,7 +494,7 @@ impl KWinScriptCommands for QdbusScriptCommands {
     ) -> impl Future<Output = Result<String, String>> + Send + 'a {
         async move {
             let path = path.to_str().ok_or("invalid temporary script path")?;
-            run_command(
+            run_qdbus_command(
                 "qdbus6",
                 &[
                     "org.kde.KWin",
@@ -293,7 +514,7 @@ impl KWinScriptCommands for QdbusScriptCommands {
     ) -> impl Future<Output = Result<(), String>> + Send + 'a {
         async move {
             let script_object = format!("/Scripting/Script{}", script_id.trim());
-            run_command(
+            run_qdbus_command(
                 "qdbus6",
                 &["org.kde.KWin", &script_object, "org.kde.kwin.Script.run"],
             )
@@ -307,7 +528,7 @@ impl KWinScriptCommands for QdbusScriptCommands {
         plugin: &'a str,
     ) -> impl Future<Output = Result<(), String>> + Send + 'a {
         async move {
-            run_command(
+            run_qdbus_command(
                 "qdbus6",
                 &[
                     "org.kde.KWin",
@@ -326,16 +547,43 @@ async fn run_script_lifecycle<C: KWinScriptCommands>(
     commands: C,
     plugin: String,
     script_path: PathBuf,
+    cancel: oneshot::Receiver<()>,
+) -> Result<(), String> {
+    run_script_lifecycle_with_timeout(
+        commands,
+        plugin,
+        script_path,
+        cancel,
+        SCRIPT_OPERATION_TIMEOUT,
+    )
+    .await
+}
+
+async fn run_script_lifecycle_with_timeout<C: KWinScriptCommands>(
+    commands: C,
+    plugin: String,
+    script_path: PathBuf,
     mut cancel: oneshot::Receiver<()>,
+    operation_timeout: Duration,
 ) -> Result<(), String> {
     if cancellation_requested(&mut cancel) {
-        let _ = std::fs::remove_file(script_path);
-        return Ok(());
+        return remove_temporary_script(&script_path);
     }
 
-    let result = match commands.load_script(&script_path, &plugin).await {
+    let result = match bounded_script_command(
+        "load",
+        commands.load_script(&script_path, &plugin),
+        operation_timeout,
+    )
+    .await
+    {
         Ok(script_id) if !cancellation_requested(&mut cancel) => {
-            commands.run_script(&script_id).await
+            bounded_script_command(
+                "execution",
+                commands.run_script(&script_id),
+                operation_timeout,
+            )
+            .await
         }
         Ok(_) => Ok(()),
         Err(error) => Err(error),
@@ -351,9 +599,51 @@ async fn run_script_lifecycle<C: KWinScriptCommands>(
 
     // Drain KWin's load/run request before unloading, then remove the script.
     // This worker remains alive when its caller is canceled.
-    let _ = commands.unload_script(&plugin).await;
-    let _ = std::fs::remove_file(script_path);
-    result
+    let unload =
+        bounded_script_command("unload", commands.unload_script(&plugin), operation_timeout)
+            .await
+            .map_err(|error| {
+                format!(
+                    "KWin script {plugin} unload failed; remote cleanup is unconfirmed: {error}"
+                )
+            });
+    let remove = remove_temporary_script(&script_path);
+    match (result, unload, remove) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (operation, unload, remove) => {
+            let errors = [operation.err(), unload.err(), remove.err()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            Err(errors.join("; "))
+        }
+    }
+}
+
+async fn bounded_script_command<T, F>(
+    operation: &str,
+    command: F,
+    limit: Duration,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    match timeout(limit, command).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "KWin script {operation} timed out after {:.1}s; remote script state is unconfirmed",
+            limit.as_secs_f64()
+        )),
+    }
+}
+
+fn remove_temporary_script(path: &std::path::Path) -> Result<(), String> {
+    std::fs::remove_file(path).map_err(|error| {
+        format!(
+            "could not remove temporary KWin script {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn cancellation_requested(cancel: &mut oneshot::Receiver<()>) -> bool {
@@ -477,6 +767,116 @@ mod tests {
         }
     }
 
+    struct DelayedRunCommands {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        run_started: Mutex<Option<oneshot::Sender<()>>>,
+        release_run: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    impl DelayedRunCommands {
+        fn new(run_started: oneshot::Sender<()>, release_run: oneshot::Receiver<()>) -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+                run_started: Mutex::new(Some(run_started)),
+                release_run: tokio::sync::Mutex::new(Some(release_run)),
+            }
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl KWinScriptCommands for DelayedRunCommands {
+        fn load_script<'a>(
+            &'a self,
+            _path: &'a std::path::Path,
+            _plugin: &'a str,
+        ) -> impl Future<Output = Result<String, String>> + Send + 'a {
+            async move {
+                self.events.lock().unwrap().push("load");
+                Ok("42".into())
+            }
+        }
+
+        fn run_script<'a>(
+            &'a self,
+            _script_id: &'a str,
+        ) -> impl Future<Output = Result<(), String>> + Send + 'a {
+            async move {
+                self.events.lock().unwrap().push("run-start");
+                if let Some(started) = self.run_started.lock().unwrap().take() {
+                    let _ = started.send(());
+                }
+                let release = self.release_run.lock().await.take().unwrap();
+                let _ = release.await;
+                self.events.lock().unwrap().push("run-finished");
+                Ok(())
+            }
+        }
+
+        fn unload_script<'a>(
+            &'a self,
+            _plugin: &'a str,
+        ) -> impl Future<Output = Result<(), String>> + Send + 'a {
+            async move {
+                self.events.lock().unwrap().push("unload");
+                Ok(())
+            }
+        }
+    }
+
+    struct ImmediateCommands {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        fail_load: bool,
+        fail_unload: bool,
+        never_load: bool,
+        never_unload: bool,
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl KWinScriptCommands for ImmediateCommands {
+        fn load_script<'a>(
+            &'a self,
+            _path: &'a std::path::Path,
+            _plugin: &'a str,
+        ) -> impl Future<Output = Result<String, String>> + Send + 'a {
+            async move {
+                self.events.lock().unwrap().push("load");
+                if self.never_load {
+                    std::future::pending().await
+                } else if self.fail_load {
+                    Err("simulated load failure".into())
+                } else {
+                    Ok("42".into())
+                }
+            }
+        }
+
+        fn run_script<'a>(
+            &'a self,
+            _script_id: &'a str,
+        ) -> impl Future<Output = Result<(), String>> + Send + 'a {
+            async move {
+                self.events.lock().unwrap().push("run");
+                Ok(())
+            }
+        }
+
+        fn unload_script<'a>(
+            &'a self,
+            _plugin: &'a str,
+        ) -> impl Future<Output = Result<(), String>> + Send + 'a {
+            async move {
+                self.events.lock().unwrap().push("unload");
+                if self.never_unload {
+                    std::future::pending().await
+                } else if self.fail_unload {
+                    Err("simulated D-Bus failure".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
     fn test_script_path() -> PathBuf {
         let sequence = NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed);
         env::temp_dir().join(format!(
@@ -530,6 +930,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), &mut finish)
             .await
             .expect("cleanup must drain the in-flight KWin load")
+            .unwrap()
             .unwrap();
 
         assert_eq!(
@@ -537,5 +938,299 @@ mod tests {
             ["load-start", "load-finished", "unload"]
         );
         assert!(!script_path.exists(), "script file survives until unload");
+    }
+
+    #[tokio::test]
+    async fn canceled_layout_drains_script_execution_before_unload() {
+        let script_path = test_script_path();
+        std::fs::write(&script_path, "test script").unwrap();
+        let (run_started_tx, run_started_rx) = oneshot::channel();
+        let (release_run_tx, release_run_rx) = oneshot::channel();
+        let commands = DelayedRunCommands::new(run_started_tx, release_run_rx);
+        let events = Arc::clone(&commands.events);
+        let cleanup = KdeCleanupQueue::default();
+        let task = KWinLayoutTask::spawn(
+            commands,
+            "test_plugin_run_cancel".into(),
+            script_path.clone(),
+            cleanup.clone(),
+        );
+
+        run_started_rx.await.unwrap();
+        drop(task);
+        let mut finish = tokio::spawn(async move { cleanup.finish().await });
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut finish)
+            .await
+            .is_err());
+        release_run_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut finish)
+            .await
+            .expect("cleanup must drain script execution")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["load", "run-start", "run-finished", "unload"]
+        );
+        assert!(!script_path.exists());
+    }
+
+    #[tokio::test]
+    async fn successful_lifecycle_unloads_and_removes_its_temporary_script() {
+        let script_path = test_script_path();
+        std::fs::write(&script_path, "test script").unwrap();
+        let commands = ImmediateCommands {
+            events: Arc::new(Mutex::new(Vec::new())),
+            fail_load: false,
+            fail_unload: false,
+            never_load: false,
+            never_unload: false,
+        };
+        let events = Arc::clone(&commands.events);
+        let (_cancel, cancelled) = oneshot::channel();
+        let result = run_script_lifecycle(
+            commands,
+            "test_plugin_success".into(),
+            script_path.clone(),
+            cancelled,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(*events.lock().unwrap(), ["load", "run", "unload"]);
+        assert!(!script_path.exists());
+    }
+
+    #[tokio::test]
+    async fn unload_failure_is_returned_and_temporary_file_is_removed() {
+        let script_path = test_script_path();
+        std::fs::write(&script_path, "test script").unwrap();
+        let commands = ImmediateCommands {
+            events: Arc::new(Mutex::new(Vec::new())),
+            fail_load: false,
+            fail_unload: true,
+            never_load: false,
+            never_unload: false,
+        };
+        let (_cancel, cancelled) = oneshot::channel();
+        let error = run_script_lifecycle(
+            commands,
+            "test_plugin_unload_failure".into(),
+            script_path.clone(),
+            cancelled,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("unload failed; remote cleanup is unconfirmed"));
+        assert!(error.contains("simulated D-Bus failure"));
+        assert!(!script_path.exists());
+    }
+
+    #[tokio::test]
+    async fn primary_lifecycle_failure_is_preserved_with_unload_failure() {
+        let script_path = test_script_path();
+        std::fs::write(&script_path, "test script").unwrap();
+        let commands = ImmediateCommands {
+            events: Arc::new(Mutex::new(Vec::new())),
+            fail_load: true,
+            fail_unload: true,
+            never_load: false,
+            never_unload: false,
+        };
+        let events = Arc::clone(&commands.events);
+        let (_cancel, cancelled) = oneshot::channel();
+
+        let error = run_script_lifecycle(
+            commands,
+            "test_plugin_primary_and_cleanup_failure".into(),
+            script_path.clone(),
+            cancelled,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("simulated load failure"));
+        assert!(error.contains("simulated D-Bus failure"));
+        assert_eq!(*events.lock().unwrap(), ["load", "unload"]);
+        assert!(!script_path.exists());
+    }
+
+    #[tokio::test]
+    async fn never_completing_load_times_out_then_attempts_unload() {
+        let script_path = test_script_path();
+        std::fs::write(&script_path, "test script").unwrap();
+        let commands = ImmediateCommands {
+            events: Arc::new(Mutex::new(Vec::new())),
+            fail_load: false,
+            fail_unload: false,
+            never_load: true,
+            never_unload: false,
+        };
+        let events = Arc::clone(&commands.events);
+        let (_cancel, cancelled) = oneshot::channel();
+
+        let error = run_script_lifecycle_with_timeout(
+            commands,
+            "test_plugin_stalled_load".into(),
+            script_path.clone(),
+            cancelled,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("KWin script load timed out"));
+        assert_eq!(*events.lock().unwrap(), ["load", "unload"]);
+        assert!(!script_path.exists());
+    }
+
+    #[tokio::test]
+    async fn never_completing_unload_times_out_and_reports_remote_uncertainty() {
+        let script_path = test_script_path();
+        std::fs::write(&script_path, "test script").unwrap();
+        let commands = ImmediateCommands {
+            events: Arc::new(Mutex::new(Vec::new())),
+            fail_load: false,
+            fail_unload: false,
+            never_load: false,
+            never_unload: true,
+        };
+        let events = Arc::clone(&commands.events);
+        let (_cancel, cancelled) = oneshot::channel();
+
+        let error = run_script_lifecycle_with_timeout(
+            commands,
+            "test_plugin_stalled_unload".into(),
+            script_path.clone(),
+            cancelled,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("unload failed; remote cleanup is unconfirmed"));
+        assert!(error.contains("unload timed out"));
+        assert_eq!(*events.lock().unwrap(), ["load", "run", "unload"]);
+        assert!(!script_path.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_queue_finishes_multiple_operations_and_reports_failures() {
+        let cleanup = KdeCleanupQueue::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        for (name, fail) in [("first", false), ("second", true), ("third", false)] {
+            let events = Arc::clone(&events);
+            cleanup.track(tokio::spawn(async move {
+                events.lock().unwrap().push(name);
+                if fail {
+                    Err("simulated cleanup failure".into())
+                } else {
+                    Ok(())
+                }
+            }));
+        }
+
+        let error = cleanup.finish().await.unwrap_err();
+        assert!(error.contains("simulated cleanup failure"));
+        let mut completed = events.lock().unwrap().clone();
+        completed.sort_unstable();
+        assert_eq!(completed, ["first", "second", "third"]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_queue_aborts_pending_tasks_after_its_deadline() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct DropMark(Arc<AtomicUsize>);
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let cleanup = KdeCleanupQueue::default();
+        let drops = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let mark = DropMark(Arc::clone(&drops));
+            cleanup.track(tokio::spawn(async move {
+                let _mark = mark;
+                std::future::pending::<Result<(), String>>().await
+            }));
+        }
+
+        let error = cleanup
+            .finish_with_timeout(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(error.contains("timed out waiting for KWin cleanup"));
+        assert!(error.contains("remote script state is unconfirmed"));
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_queue_deadline_keeps_completed_results_around_pending_tasks() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct DropMark(Arc<AtomicUsize>);
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let cleanup = KdeCleanupQueue::default();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let pending_mark = DropMark(Arc::clone(&drops));
+        cleanup.track(tokio::spawn(async move {
+            let _mark = pending_mark;
+            std::future::pending::<Result<(), String>>().await
+        }));
+        cleanup.track(tokio::spawn(async {
+            Err("simulated unload failure".into())
+        }));
+        cleanup.track(tokio::spawn(async { Ok(()) }));
+
+        let error = cleanup
+            .finish_with_timeout(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(error.contains("simulated unload failure"));
+        assert!(error.contains("timed out waiting for KWin cleanup"));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn subprocess_timeout_terminates_and_reaps_owned_child() {
+        let pid_path = test_script_path().with_extension("pid");
+        let pid_path_str = pid_path.to_str().unwrap();
+        let command = format!("echo $$ > '{pid_path_str}'; exec sleep 60");
+        let error = run_command_with_timeout("sh", &["-c", &command], Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.contains("timed out"));
+        assert!(error.contains("child was terminated and reaped"));
+
+        let pid = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let process_path = PathBuf::from(format!("/proc/{pid}"));
+        assert!(
+            !process_path.exists(),
+            "timed-out child was still present when the command runner returned"
+        );
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    #[tokio::test]
+    async fn subprocess_runner_captures_output_on_success() {
+        let output = run_command_with_timeout(
+            "sh",
+            &["-c", "printf 'captured'; printf 'diagnostic' >&2"],
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "captured");
     }
 }

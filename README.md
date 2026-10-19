@@ -80,7 +80,7 @@ Layouts with explicit **Unmute**, **Turn audio on**, or **Audio is muted** butto
 
 Without `--unmute` (or with `--no-unmute`), the program leaves the existing audio state alone. It does not force videos to be muted.
 
-This feature uses Firefox's AT-SPI accessibility tree and currently recognizes English audio labels. It temporarily enables desktop accessibility if needed, then restores the previous setting on normal exit, X, or Ctrl-C. An accessibility bus (`org.a11y.Bus`, typically provided by `at-spi2-core`) must be available. A forced kill may leave accessibility enabled.
+This feature uses Firefox's AT-SPI accessibility tree and currently recognizes English audio labels. It temporarily enables desktop accessibility if needed, then restores the previous setting on normal exit, X, or Ctrl-C. An accessibility bus (`org.a11y.Bus`, typically provided by `at-spi2-core`) must be available. A forced kill may leave accessibility enabled; if a bounded cleanup attempt times out, the program reports that the final setting is unconfirmed.
 
 If the control is missing, hidden, ambiguous, or inaccessible, it prints a warning and continues scrolling without toggling audio. Popups, Firefox accessibility restrictions, and Instagram layout changes can prevent detection. This option cannot override a muted Firefox tab, system volume, or a reel with no audio track.
 
@@ -120,9 +120,10 @@ The CLI starts the application layer in `src/app.rs`. The shared engine in
 stagger offsets, scrolling, optional audio, and error propagation through small
 interfaces. `src/browser/firefox.rs` owns Firefox launch and window discovery;
 `src/platform/kde_wayland.rs` owns KWin scripting, `qdbus6`, and the single
-wdotool input session. `src/layout.rs` contains the grid and rectangle checks
-used by both the engine and the KWin layout script. Audio and stop signaling
-have their own modules, with KDE shortcut registration in `src/stop_key.rs`.
+wdotool input session. `src/layout.rs` contains only grid and rectangle
+calculations; the KDE backend builds the corresponding KWin script. Audio and
+stop signaling have their own modules, with KDE shortcut registration in
+`src/stop_key.rs`.
 
 KDE Plasma 6 on Wayland with Firefox remains the only supported combination.
 The boundaries make another browser adapter possible without changing the
@@ -159,11 +160,13 @@ That is the desktop portal announcing the input permission this program uses. On
 ## Development checks
 
 ```bash
-rtk cargo fmt --all -- --check
-rtk cargo clippy --all-targets -- -D warnings
-rtk cargo test
-rtk cargo build --release --locked
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build --release --locked
 ```
+
+`rtk` may be prefixed to these commands as an optional local convenience.
 
 The KDE shortcut integration test is ignored by default because it needs a live desktop session. Run it separately when no other copy of the scroller is running:
 
